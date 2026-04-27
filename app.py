@@ -10,7 +10,10 @@ Como executar:
     streamlit run app.py
 
 Autor: Julio Dantas (gerado com Claude)
-Versão: 0.1 (primeira versão — iremos refinando)
+Versão: 0.2 — adiciona detecção de padrões gráficos (fundos/topos
+ascendentes, golden/death cross, rompimentos, divergência RSI, surge de
+volume), benchmark setorial (DY/PL/PVP vs. mediana do setor) e geração
+de narrativa textual consolidando todos os sinais.
 """
 
 from __future__ import annotations
@@ -171,6 +174,193 @@ def trend_signal(close: pd.Series) -> str:
 
 
 # --------------------------------------------------------------------------
+# DETECÇÃO DE PADRÕES GRÁFICOS
+# --------------------------------------------------------------------------
+def find_swing_points(series: pd.Series, window: int = 5):
+    """Encontra topos e fundos locais (pivôs) com confirmação de ±window dias."""
+    series = series.dropna()
+    highs, lows = [], []
+    if len(series) < 2 * window + 1:
+        return highs, lows
+    vals = series.values
+    idx = series.index
+    for i in range(window, len(series) - window):
+        win = vals[i - window: i + window + 1]
+        v = vals[i]
+        if v == win.max() and v > vals[i - 1]:
+            highs.append((idx[i], float(v)))
+        if v == win.min() and v < vals[i - 1]:
+            lows.append((idx[i], float(v)))
+    return highs, lows
+
+
+def detect_patterns(df: pd.DataFrame) -> dict:
+    """
+    Identifica padrões gráficos relevantes na série de preços.
+    Retorna dict {pattern_id: {label, tipo (alta/baixa/neutro), detail}}.
+    """
+    patterns: dict = {}
+    if df is None or df.empty or "Close" not in df.columns:
+        return patterns
+
+    close = df["Close"].dropna()
+    if len(close) < 60:
+        return patterns
+
+    # ---- 1. Topos e fundos (swings) ----
+    highs, lows = find_swing_points(close, window=5)
+
+    if len(lows) >= 3:
+        recent = [v for _, v in lows[-3:]]
+        if recent[0] < recent[1] < recent[2]:
+            patterns["fundos_ascendentes"] = {
+                "label": "Fundos ascendentes",
+                "tipo": "alta",
+                "detail": (
+                    f"Últimos 3 fundos: R$ {recent[0]:.2f} → "
+                    f"R$ {recent[1]:.2f} → R$ {recent[2]:.2f} "
+                    "(estrutura clássica de tendência de alta)."
+                ),
+            }
+        elif recent[0] > recent[1] > recent[2]:
+            patterns["fundos_descendentes"] = {
+                "label": "Fundos descendentes",
+                "tipo": "baixa",
+                "detail": (
+                    f"Últimos 3 fundos: R$ {recent[0]:.2f} → "
+                    f"R$ {recent[1]:.2f} → R$ {recent[2]:.2f} "
+                    "(estrutura típica de tendência de baixa)."
+                ),
+            }
+
+    if len(highs) >= 3:
+        recent = [v for _, v in highs[-3:]]
+        if recent[0] < recent[1] < recent[2]:
+            patterns["topos_ascendentes"] = {
+                "label": "Topos ascendentes",
+                "tipo": "alta",
+                "detail": (
+                    f"Últimos 3 topos: R$ {recent[0]:.2f} → "
+                    f"R$ {recent[1]:.2f} → R$ {recent[2]:.2f}."
+                ),
+            }
+        elif recent[0] > recent[1] > recent[2]:
+            patterns["topos_descendentes"] = {
+                "label": "Topos descendentes",
+                "tipo": "baixa",
+                "detail": (
+                    f"Últimos 3 topos: R$ {recent[0]:.2f} → "
+                    f"R$ {recent[1]:.2f} → R$ {recent[2]:.2f}."
+                ),
+            }
+
+    # ---- 2. Golden/Death cross (cruzamento SMA50 x SMA200) ----
+    if len(close) >= 200:
+        s50 = sma(close, 50)
+        s200 = sma(close, 200)
+        diff = (s50 - s200).dropna()
+        recent_diff = diff.tail(30)
+        if len(recent_diff) > 1:
+            signs = np.sign(recent_diff.values)
+            sign_changes = np.where(np.diff(signs) != 0)[0]
+            if len(sign_changes) > 0:
+                last_change = sign_changes[-1] + 1
+                d = recent_diff.index[last_change]
+                if signs[last_change] > 0:
+                    patterns["golden_cross"] = {
+                        "label": "Golden cross (SMA50 × SMA200)",
+                        "tipo": "alta",
+                        "detail": (
+                            f"SMA50 cruzou ACIMA da SMA200 em "
+                            f"{d.strftime('%d/%m/%Y')} — sinal clássico "
+                            "de virada de tendência para alta."
+                        ),
+                    }
+                else:
+                    patterns["death_cross"] = {
+                        "label": "Death cross (SMA50 × SMA200)",
+                        "tipo": "baixa",
+                        "detail": (
+                            f"SMA50 cruzou ABAIXO da SMA200 em "
+                            f"{d.strftime('%d/%m/%Y')} — sinal de virada "
+                            "para baixa."
+                        ),
+                    }
+
+    # ---- 3. Rompimento de resistência / perda de suporte (60 pregões) ----
+    if len(close) >= 61:
+        last = float(close.iloc[-1])
+        prev_max = float(close.iloc[-61:-1].max())
+        prev_min = float(close.iloc[-61:-1].min())
+        if last > prev_max * 1.005:
+            patterns["rompimento_resistencia"] = {
+                "label": "Rompimento de resistência",
+                "tipo": "alta",
+                "detail": (
+                    f"Preço (R$ {last:.2f}) rompeu a máxima dos últimos "
+                    f"60 pregões (R$ {prev_max:.2f})."
+                ),
+            }
+        elif last < prev_min * 0.995:
+            patterns["perda_suporte"] = {
+                "label": "Perda de suporte",
+                "tipo": "baixa",
+                "detail": (
+                    f"Preço (R$ {last:.2f}) perdeu a mínima dos últimos "
+                    f"60 pregões (R$ {prev_min:.2f})."
+                ),
+            }
+
+    # ---- 4. Volume crescente nos últimos pregões ----
+    if "Volume" in df.columns and len(df) >= 30:
+        recent_vol = float(df["Volume"].tail(5).mean())
+        avg_vol = float(df["Volume"].tail(30).mean())
+        if avg_vol > 0 and recent_vol > avg_vol * 1.5:
+            tipo = "alta" if close.iloc[-1] > close.iloc[-5] else "neutro"
+            patterns["volume_crescente"] = {
+                "label": "Volume crescente",
+                "tipo": tipo,
+                "detail": (
+                    f"Volume dos últimos 5 pregões está "
+                    f"{recent_vol / avg_vol:.1f}× acima da média de 30 dias — "
+                    "indica entrada de fluxo no ativo."
+                ),
+            }
+
+    # ---- 5. Divergência RSI (preço vs momentum) ----
+    if len(close) >= 60:
+        rsi_series = rsi(close).dropna()
+        if len(rsi_series) >= 30:
+            rc = close.tail(30)
+            rr = rsi_series.tail(30)
+            half = 15
+            c1_min, c2_min = rc.iloc[:half].min(), rc.iloc[half:].min()
+            r1_min, r2_min = rr.iloc[:half].min(), rr.iloc[half:].min()
+            c1_max, c2_max = rc.iloc[:half].max(), rc.iloc[half:].max()
+            r1_max, r2_max = rr.iloc[:half].max(), rr.iloc[half:].max()
+            if c2_min < c1_min and r2_min > r1_min:
+                patterns["divergencia_alta_rsi"] = {
+                    "label": "Divergência de alta no RSI",
+                    "tipo": "alta",
+                    "detail": (
+                        "Preço fez fundo mais baixo, mas RSI fez fundo "
+                        "mais alto — sinal de exaustão da queda."
+                    ),
+                }
+            if c2_max > c1_max and r2_max < r1_max:
+                patterns["divergencia_baixa_rsi"] = {
+                    "label": "Divergência de baixa no RSI",
+                    "tipo": "baixa",
+                    "detail": (
+                        "Preço fez topo mais alto, mas RSI fez topo "
+                        "mais baixo — sinal de exaustão da alta."
+                    ),
+                }
+
+    return patterns
+
+
+# --------------------------------------------------------------------------
 # ANÁLISE POR ATIVO
 # --------------------------------------------------------------------------
 def analyze_ticker(
@@ -234,8 +424,14 @@ def analyze_ticker(
 
     # Dados fundamentalistas
     info = fetch_ticker_info(ticker)
-    dy = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
-    dy_pct = (dy * 100) if dy is not None and dy < 1.5 else dy  # yfinance às vezes retorna já em %
+    dy_raw = info.get("dividendYield")
+    if dy_raw is None:
+        dy_raw = info.get("trailingAnnualDividendYield")
+    # yfinance retorna em fração (0.08 = 8%) ou já em % — normaliza para %
+    if dy_raw is not None:
+        dy_pct = (dy_raw * 100) if dy_raw < 1.5 else float(dy_raw)
+    else:
+        dy_pct = None
 
     return {
         "ticker": ticker,
@@ -263,6 +459,7 @@ def analyze_ticker(
         "min_52s": info.get("fiftyTwoWeekLow"),
         "_close_series": close,
         "_ohlcv_df": df[["Open", "High", "Low", "Close", "Volume"]].copy(),
+        "_patterns": detect_patterns(df),
     }
 
 
@@ -372,6 +569,61 @@ def classify(score: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# BENCHMARK SETORIAL
+# --------------------------------------------------------------------------
+def compute_sector_benchmarks(df: pd.DataFrame) -> dict:
+    """
+    Calcula medianas por setor para DY, P/L, P/VP e retorno do mês.
+    Setores com menos de 2 ativos são ignorados.
+    """
+    bench: dict = {}
+    metrics = ["DY_%", "P/L", "P/VP", "retorno_mês_%"]
+    for setor, group in df.groupby("setor"):
+        if len(group) < 2:
+            continue
+        b = {"n": int(len(group))}
+        for m in metrics:
+            if m in group.columns:
+                series = pd.to_numeric(group[m], errors="coerce").dropna()
+                b[m] = float(series.median()) if len(series) > 0 else None
+        bench[setor] = b
+    return bench
+
+
+def compare_to_sector(row: dict, benchmarks: dict) -> dict:
+    """
+    Compara métricas do ativo com a mediana do seu setor.
+    Retorna {metrica: {valor, mediana_setor, delta_pct, delta_abs}}.
+    """
+    setor = row.get("setor")
+    out: dict = {}
+    if not setor or setor not in benchmarks:
+        return out
+    bench = benchmarks[setor]
+    for m in ["DY_%", "P/L", "P/VP", "retorno_mês_%"]:
+        v = row.get(m)
+        b = bench.get(m)
+        if v is None or b is None:
+            continue
+        try:
+            v = float(v)
+            b = float(b)
+        except (TypeError, ValueError):
+            continue
+        if np.isnan(v) or np.isnan(b):
+            continue
+        delta_pct = ((v / b - 1) * 100) if b != 0 else None
+        out[m] = {
+            "valor": v,
+            "mediana_setor": b,
+            "delta_pct": delta_pct,
+            "delta_abs": v - b,
+            "n_setor": bench.get("n"),
+        }
+    return out
+
+
+# --------------------------------------------------------------------------
 # GRÁFICOS
 # --------------------------------------------------------------------------
 def plot_price_chart(close: pd.Series, ticker: str) -> go.Figure:
@@ -478,6 +730,194 @@ def format_pct(v):
     return f"{v:.2f}%"
 
 
+# --------------------------------------------------------------------------
+# GERAÇÃO DE NARRATIVA (combina score + tendência + padrões + setor)
+# --------------------------------------------------------------------------
+def _safe_float(v):
+    try:
+        f = float(v)
+        return f if not np.isnan(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def generate_narrative(row: dict, patterns: dict, sector_compare: dict) -> str:
+    """
+    Gera um parágrafo de análise consolidando:
+      - score + classificação
+      - tendência por médias móveis
+      - padrões gráficos detectados
+      - RSI, volatilidade, liquidez
+      - comparação com mediana do setor (DY, P/L)
+      - distância do topo de 52 semanas
+    """
+    parts: list[str] = []
+
+    nome = row.get("nome", row.get("ticker", "Ativo"))
+    score = _safe_float(row.get("score")) or 0.0
+    setor = row.get("setor") or "-"
+
+    # 1. Frase de abertura — tese baseada no score
+    if score >= 70:
+        parts.append(
+            f"**{nome}** é um forte candidato a compra (score {score:.1f}/100, "
+            f"setor: {setor})."
+        )
+    elif score >= 55:
+        parts.append(
+            f"**{nome}** é um candidato atrativo (score {score:.1f}/100, "
+            f"setor: {setor})."
+        )
+    elif score >= 40:
+        parts.append(
+            f"**{nome}** está em zona neutra (score {score:.1f}/100, "
+            f"setor: {setor}) — aguardar melhores sinais."
+        )
+    else:
+        parts.append(
+            f"**{nome}** apresenta sinais desfavoráveis (score "
+            f"{score:.1f}/100, setor: {setor})."
+        )
+
+    # 2. Tendência
+    trend = row.get("tendência")
+    if trend == "alta forte":
+        parts.append(
+            "Tendência de alta forte com SMA20 > SMA50 > SMA200 e preço "
+            "acima das três médias."
+        )
+    elif trend == "alta":
+        parts.append(
+            "Preço acima das médias de curto e médio prazo, configurando "
+            "tendência de alta."
+        )
+    elif trend == "lateral":
+        parts.append("Tendência lateral — sem direção clara nas médias móveis.")
+    elif trend == "baixa":
+        parts.append(
+            "Tendência de baixa com preço abaixo das principais médias."
+        )
+
+    # 3. Padrões gráficos — separar bullish e bearish
+    if patterns:
+        bullish = [p for p in patterns.values() if p.get("tipo") == "alta"]
+        bearish = [p for p in patterns.values() if p.get("tipo") == "baixa"]
+        if bullish:
+            labels = ", ".join(p["label"].lower() for p in bullish)
+            parts.append(f"Sinais positivos no gráfico: {labels}.")
+        if bearish:
+            labels = ", ".join(p["label"].lower() for p in bearish)
+            parts.append(f"Sinais negativos no gráfico: {labels}.")
+
+    # 4. RSI
+    rsi_v = _safe_float(row.get("RSI"))
+    if rsi_v is not None:
+        if rsi_v < 30:
+            parts.append(
+                f"RSI em {rsi_v:.0f} indica sobrevenda — possível ponto de "
+                "retomada técnica."
+            )
+        elif rsi_v > 70:
+            parts.append(
+                f"RSI em {rsi_v:.0f} indica sobrecompra — risco de correção."
+            )
+        elif 45 <= rsi_v <= 65:
+            parts.append(f"RSI em {rsi_v:.0f} (faixa saudável de momentum).")
+        else:
+            parts.append(f"RSI em {rsi_v:.0f}.")
+
+    # 5. Comparação setorial — DY
+    dy = _safe_float(row.get("DY_%"))
+    if dy is not None:
+        cmp = sector_compare.get("DY_%")
+        if cmp and cmp.get("delta_pct") is not None:
+            d = cmp["delta_pct"]
+            if d > 15:
+                parts.append(
+                    f"DY de {dy:.2f}% supera a mediana do setor "
+                    f"({cmp['mediana_setor']:.2f}%) em {d:.0f}% — "
+                    "atrativo para renda."
+                )
+            elif d < -15:
+                parts.append(
+                    f"DY de {dy:.2f}% está {-d:.0f}% abaixo da mediana "
+                    f"setorial ({cmp['mediana_setor']:.2f}%)."
+                )
+            else:
+                parts.append(
+                    f"DY de {dy:.2f}% em linha com a mediana setorial "
+                    f"({cmp['mediana_setor']:.2f}%)."
+                )
+        else:
+            parts.append(f"DY anual de {dy:.2f}%.")
+
+    # 6. Comparação setorial — P/L
+    pl = _safe_float(row.get("P/L"))
+    if pl is not None and pl > 0:
+        cmp = sector_compare.get("P/L")
+        if cmp and cmp.get("delta_pct") is not None:
+            d = cmp["delta_pct"]
+            if d < -20:
+                parts.append(
+                    f"P/L de {pl:.1f} está {-d:.0f}% abaixo da mediana do "
+                    "setor — valuation potencialmente atrativo."
+                )
+            elif d > 30:
+                parts.append(
+                    f"P/L de {pl:.1f} está {d:.0f}% acima do setor — "
+                    "valuation esticado."
+                )
+
+    # 7. Liquidez
+    vol = _safe_float(row.get("volume_médio_R$"))
+    if vol is not None:
+        if vol >= 100e6:
+            parts.append(
+                f"Liquidez excelente ({format_money(vol)}/dia em média)."
+            )
+        elif vol >= 20e6:
+            parts.append(
+                f"Liquidez confortável ({format_money(vol)}/dia em média)."
+            )
+        elif vol < 5e6:
+            parts.append(
+                f"Atenção: liquidez baixa ({format_money(vol)}/dia) pode "
+                "dificultar entrada/saída sem afetar preço."
+            )
+
+    # 8. Volatilidade
+    vola = _safe_float(row.get("vol_anual_%"))
+    if vola is not None:
+        if vola > 50:
+            parts.append(
+                f"Volatilidade alta ({vola:.0f}% a.a.) — exige tolerância "
+                "a oscilações."
+            )
+        elif vola < 25:
+            parts.append(
+                f"Volatilidade baixa ({vola:.0f}% a.a.) — perfil mais estável."
+            )
+
+    # 9. Distância do topo de 52 semanas
+    price = _safe_float(row.get("preço"))
+    hi52 = _safe_float(row.get("max_52s"))
+    if price and hi52 and hi52 > 0:
+        dist = (hi52 - price) / hi52 * 100
+        if dist < 5:
+            parts.append(
+                f"Cotação a {dist:.1f}% da máxima de 52 semanas — momentum "
+                "positivo confirmado."
+            )
+        elif dist > 30:
+            parts.append(
+                f"Cotação {dist:.0f}% abaixo da máxima de 52 semanas — "
+                "pode ser oportunidade de valor ou problema estrutural; "
+                "checar fundamentos."
+            )
+
+    return " ".join(parts)
+
+
 def main():
     st.title("Dashboard de Ativos — Top 10 do Mês Anterior")
     st.caption(
@@ -559,6 +999,9 @@ def main():
         st.warning("Nenhum ativo passou no filtro de liquidez. Reduza o mínimo.")
         return
 
+    # Benchmarks setoriais (calculados sobre o universo filtrado)
+    sector_benchmarks = compute_sector_benchmarks(df)
+
     # --------- KPIs DE MERCADO ---------
     st.subheader("Visão geral do mercado no período")
     c1, c2, c3, c4 = st.columns(4)
@@ -569,9 +1012,11 @@ def main():
     )
     positivos = (df["retorno_mês_%"] > 0).sum()
     c3.metric("% em alta", f"{positivos / len(df) * 100:.0f}%")
+    dy_series = df["DY_%"].dropna()
     c4.metric(
         "DY médio (anual)",
-        f"{df['DY_%'].dropna().mean():.2f}%" if df["DY_%"].notna().any() else "-",
+        f"{dy_series.mean():.2f}%" if len(dy_series) > 0 else "-",
+        f"{len(dy_series)}/{len(df)} ativos com dado",
     )
 
     st.divider()
@@ -636,6 +1081,66 @@ def main():
         k3.metric("DY (anual)", format_pct(linha["DY_%"]))
         k4.metric("Score", f"{linha['score']:.1f}/100", linha["classificação"])
         k5.metric("Tendência", linha["tendência"].title())
+
+        # ----- Narrativa gerada (combina padrões + setor + indicadores) -----
+        linha_dict = linha.to_dict()
+        patterns = linha_dict.get("_patterns") or {}
+        sector_cmp = compare_to_sector(linha_dict, sector_benchmarks)
+        narrative = generate_narrative(linha_dict, patterns, sector_cmp)
+
+        st.markdown("#### Análise consolidada")
+        st.info(narrative)
+
+        # ----- Chips de padrões detectados -----
+        if patterns:
+            st.markdown("**Padrões gráficos detectados:**")
+            cols_patt = st.columns(min(len(patterns), 4))
+            for i, (pid, p) in enumerate(patterns.items()):
+                col = cols_patt[i % len(cols_patt)]
+                tipo = p.get("tipo", "neutro")
+                if tipo == "alta":
+                    col.success(f"**{p['label']}**\n\n{p['detail']}")
+                elif tipo == "baixa":
+                    col.error(f"**{p['label']}**\n\n{p['detail']}")
+                else:
+                    col.warning(f"**{p['label']}**\n\n{p['detail']}")
+        else:
+            st.caption(
+                "Nenhum padrão gráfico relevante detectado no histórico recente."
+            )
+
+        # ----- Comparação com o setor -----
+        if sector_cmp:
+            st.markdown("**Comparação com o setor**")
+            n_setor = next(iter(sector_cmp.values())).get("n_setor", "?")
+            st.caption(
+                f"Mediana calculada sobre {n_setor} ativos do setor "
+                f"\"{linha['setor']}\" no universo analisado."
+            )
+            cmp_rows = []
+            label_map = {
+                "DY_%": "Dividend Yield (%)",
+                "P/L": "P/L",
+                "P/VP": "P/VP",
+                "retorno_mês_%": "Retorno do mês (%)",
+            }
+            for metric, data in sector_cmp.items():
+                d_pct = data.get("delta_pct")
+                if d_pct is None:
+                    sit = "—"
+                elif d_pct > 15:
+                    sit = f"↑ {d_pct:+.0f}% acima do setor"
+                elif d_pct < -15:
+                    sit = f"↓ {d_pct:+.0f}% abaixo do setor"
+                else:
+                    sit = f"≈ {d_pct:+.0f}% (em linha)"
+                cmp_rows.append({
+                    "Métrica": label_map.get(metric, metric),
+                    "Ativo": f"{data['valor']:.2f}",
+                    "Mediana setor": f"{data['mediana_setor']:.2f}",
+                    "Posição": sit,
+                })
+            st.dataframe(pd.DataFrame(cmp_rows), hide_index=True, use_container_width=True)
 
         col_a, col_b = st.columns([2, 1])
 
