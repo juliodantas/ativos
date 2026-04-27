@@ -31,7 +31,6 @@ from plotly.subplots import make_subplots
 # --------------------------------------------------------------------------
 st.set_page_config(
     page_title="Dashboard de Ativos — Top 10 do Mês",
-    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -262,7 +261,8 @@ def analyze_ticker(
         "tendência": trend,
         "max_52s": info.get("fiftyTwoWeekHigh"),
         "min_52s": info.get("fiftyTwoWeekLow"),
-        "_close_series": close,  # para gráficos
+        "_close_series": close,
+        "_ohlcv_df": df[["Open", "High", "Low", "Close", "Volume"]].copy(),
     }
 
 
@@ -363,12 +363,12 @@ def compute_score(row: dict) -> dict:
 
 def classify(score: float) -> str:
     if score >= 70:
-        return "🟢 Forte candidato"
+        return "Forte candidato"
     if score >= 55:
-        return "🟡 Atrativo"
+        return "Atrativo"
     if score >= 40:
-        return "🟠 Neutro"
-    return "🔴 Evitar"
+        return "Neutro"
+    return "Evitar"
 
 
 # --------------------------------------------------------------------------
@@ -403,6 +403,60 @@ def plot_price_chart(close: pd.Series, ticker: str) -> go.Figure:
     return fig
 
 
+def plot_candlestick_chart(df: pd.DataFrame, ticker: str, period_days: int = 90) -> go.Figure:
+    df_plot = df.dropna(subset=["Open", "High", "Low", "Close"]).tail(period_days).copy()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.75, 0.25],
+    )
+
+    fig.add_trace(go.Candlestick(
+        x=df_plot.index,
+        open=df_plot["Open"],
+        high=df_plot["High"],
+        low=df_plot["Low"],
+        close=df_plot["Close"],
+        name="OHLC",
+        increasing_line_color="#2ecc71",
+        decreasing_line_color="#e74c3c",
+    ), row=1, col=1)
+
+    close_plot = df_plot["Close"]
+    for window, color, dash, label in [
+        (20, "#ff7f0e", "dot", "SMA 20"),
+        (50, "#2ca02c", "dash", "SMA 50"),
+    ]:
+        if len(close_plot) >= window:
+            sma_vals = sma(close_plot, window)
+            fig.add_trace(go.Scatter(
+                x=df_plot.index, y=sma_vals.values, mode="lines",
+                name=label, line=dict(color=color, width=1, dash=dash),
+            ), row=1, col=1)
+
+    bar_colors = [
+        "#2ecc71" if c >= o else "#e74c3c"
+        for c, o in zip(df_plot["Close"], df_plot["Open"])
+    ]
+    fig.add_trace(go.Bar(
+        x=df_plot.index, y=df_plot["Volume"],
+        marker_color=bar_colors, showlegend=False, name="Volume",
+    ), row=2, col=1)
+
+    fig.update_layout(
+        title=f"{ticker} — Candlestick",
+        height=450,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=-0.12),
+    )
+    fig.update_yaxes(title_text="Preço (R$)", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    return fig
+
+
 # --------------------------------------------------------------------------
 # INTERFACE
 # --------------------------------------------------------------------------
@@ -425,7 +479,7 @@ def format_pct(v):
 
 
 def main():
-    st.title("📈 Dashboard de Ativos — Top 10 do Mês Anterior")
+    st.title("Dashboard de Ativos — Top 10 do Mês Anterior")
     st.caption(
         "Análise probabilística multi-fator de ações do Ibovespa e principais FIIs. "
         "Dados via yfinance. Atualização diária."
@@ -433,7 +487,7 @@ def main():
 
     # --------- SIDEBAR ---------
     with st.sidebar:
-        st.header("⚙️ Configurações")
+        st.header("Configurações")
 
         ref_date = st.date_input(
             "Data de referência",
@@ -458,8 +512,8 @@ def main():
         )
 
         st.divider()
-        st.caption(f"🗓️ Executado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-        run_btn = st.button("🔄 Atualizar análise", type="primary", use_container_width=True)
+        st.caption(f"Executado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        run_btn = st.button("Atualizar análise", type="primary", use_container_width=True)
 
     # --------- SELEÇÃO DO UNIVERSO ---------
     tickers = []
@@ -506,7 +560,7 @@ def main():
         return
 
     # --------- KPIs DE MERCADO ---------
-    st.subheader("📊 Visão geral do mercado no período")
+    st.subheader("Visão geral do mercado no período")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Ativos analisados", len(df))
     c2.metric(
@@ -523,7 +577,7 @@ def main():
     st.divider()
 
     # --------- TOP 10 POR PERFORMANCE DO MÊS ---------
-    st.subheader(f"🏆 Top {top_n} — Melhor performance em {month_label(prev_start)}")
+    st.subheader(f"Top {top_n} — Melhor performance em {month_label(prev_start)}")
     top_perf = df.sort_values("retorno_mês_%", ascending=False).head(top_n)
 
     display_cols = [
@@ -548,7 +602,7 @@ def main():
     )
 
     # --------- RANKING PROBABILÍSTICO (SCORE) ---------
-    st.subheader(f"🎯 Top {top_n} — Melhor score probabilístico (sugestões de compra)")
+    st.subheader(f"Top {top_n} — Melhor score probabilístico (sugestões de compra)")
     top_score = df.sort_values("score", ascending=False).head(top_n)
     st.dataframe(
         top_score[display_cols].style.format(fmt_map, na_rep="-").background_gradient(
@@ -558,7 +612,7 @@ def main():
     )
 
     st.caption(
-        "⚖️ **Score** combina: Momentum (25%) + Técnico/RSI/Tendência (20%) + "
+        "**Score** combina: Momentum (25%) + Técnico/RSI/Tendência (20%) + "
         "Liquidez (15%) + DY (15%) + Valuation (10%) + Baixa volatilidade (10%) + "
         "Distância do topo 52s (5%)."
     )
@@ -566,7 +620,7 @@ def main():
     st.divider()
 
     # --------- ANÁLISE DETALHADA DE UM ATIVO ---------
-    st.subheader("🔍 Análise detalhada por ativo")
+    st.subheader("Análise detalhada por ativo")
     opcoes = top_score["ticker"].tolist()
     escolha = st.selectbox("Selecione um ativo:", opcoes)
 
@@ -586,11 +640,26 @@ def main():
         col_a, col_b = st.columns([2, 1])
 
         with col_a:
-            serie = linha["_close_series"]
-            st.plotly_chart(plot_price_chart(serie, escolha), use_container_width=True)
+            tab_linha, tab_candle = st.tabs(["Linha", "Candles"])
+            with tab_linha:
+                serie = linha["_close_series"]
+                st.plotly_chart(plot_price_chart(serie, escolha), use_container_width=True)
+            with tab_candle:
+                periodo = st.radio(
+                    "Período:",
+                    ["1 mês", "3 meses", "6 meses", "1 ano", "Máximo"],
+                    horizontal=True,
+                    key="candle_period",
+                )
+                days_map = {"1 mês": 22, "3 meses": 66, "6 meses": 132, "1 ano": 252, "Máximo": 9999}
+                ohlcv = linha["_ohlcv_df"]
+                st.plotly_chart(
+                    plot_candlestick_chart(ohlcv, escolha, days_map[periodo]),
+                    use_container_width=True,
+                )
 
         with col_b:
-            st.markdown("**📐 Indicadores técnicos**")
+            st.markdown("**Indicadores técnicos**")
             st.dataframe(
                 pd.DataFrame({
                     "Indicador": ["RSI (14)", "SMA 20", "SMA 50", "SMA 200", "Vol. anual"],
@@ -604,7 +673,7 @@ def main():
                 }),
                 hide_index=True,
             )
-            st.markdown("**📊 Fundamentos**")
+            st.markdown("**Fundamentos**")
             st.dataframe(
                 pd.DataFrame({
                     "Indicador": ["P/L", "P/VP", "Beta", "Market Cap",
@@ -623,7 +692,7 @@ def main():
             )
 
         # Detalhamento do score
-        st.markdown("**🧮 Decomposição do score probabilístico**")
+        st.markdown("**Decomposição do score probabilístico**")
         score_parts = pd.DataFrame({
             "Fator": ["Momentum", "Técnico", "Liquidez", "DY", "Valuation", "Volatilidade"],
             "Pontuação (0-100)": [
@@ -651,7 +720,7 @@ def main():
     st.divider()
 
     # --------- TABELA COMPLETA ---------
-    with st.expander("📋 Ver tabela completa de todos os ativos analisados"):
+    with st.expander("Ver tabela completa de todos os ativos analisados"):
         full_cols = [c for c in df.columns if not c.startswith("_")]
         st.dataframe(
             df[full_cols].sort_values("score", ascending=False),
@@ -659,7 +728,7 @@ def main():
         )
 
     st.caption(
-        "⚠️ **Aviso:** Esta aplicação é uma ferramenta de apoio à decisão. "
+        "**Aviso:** Esta aplicação é uma ferramenta de apoio à decisão. "
         "Não constitui recomendação de investimento. Rentabilidade passada não "
         "garante rentabilidade futura."
     )
