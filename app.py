@@ -1,19 +1,21 @@
 """
-Dashboard de Análise de Ativos — Top 10 do Mês Anterior
-========================================================
+Dashboard de Análise de Ativos — Top 10 do Mês
+================================================
 Aplicação Streamlit que usa yfinance para buscar ações do Ibovespa e principais
-FIIs, analisar performance do mês anterior e sugerir os 10 melhores candidatos
-para compra com base em análise probabilística (multi-fator).
+FIIs, analisar performance do mês selecionado (default: mês corrente parcial,
+com possibilidade de navegar para meses anteriores) e sugerir os 10 melhores
+candidatos para compra com base em análise probabilística (multi-fator).
 
 Como executar:
     pip install -r requirements.txt
     streamlit run app.py
 
 Autor: Julio Dantas (gerado com Claude)
-Versão: 0.2 — adiciona detecção de padrões gráficos (fundos/topos
-ascendentes, golden/death cross, rompimentos, divergência RSI, surge de
-volume), benchmark setorial (DY/PL/PVP vs. mediana do setor) e geração
-de narrativa textual consolidando todos os sinais.
+Versão: 0.4 — adiciona seção "Sobre o ativo" na análise detalhada com
+descrição do negócio (longBusinessSummary), indústria, sede, funcionários,
+valor de mercado e site oficial, mais coerção robusta de tipos do yfinance.
+v0.3 — análise default passa a ser o MÊS CORRENTE com seletor de mês.
+v0.2 — detecção de padrões gráficos, benchmark setorial e narrativa textual.
 """
 
 from __future__ import annotations
@@ -82,6 +84,42 @@ def previous_month_range(reference: Optional[date] = None) -> tuple[date, date]:
     return first_of_prev, last_of_prev
 
 
+def month_range(year: int, month: int, today: Optional[date] = None) -> tuple[date, date]:
+    """
+    Retorna (primeiro_dia, último_dia_observado) de um mês qualquer.
+    Se for o mês corrente e ainda não terminou, o último dia é HOJE
+    (análise parcial). Caso contrário, é o último dia do mês.
+    """
+    if today is None:
+        today = date.today()
+    first = date(year, month, 1)
+    if month == 12:
+        next_first = date(year + 1, 1, 1)
+    else:
+        next_first = date(year, month + 1, 1)
+    last_of_month = next_first - timedelta(days=1)
+    if (year, month) == (today.year, today.month):
+        last = min(today, last_of_month)
+    else:
+        last = last_of_month
+    return first, last
+
+
+def list_recent_months(today: Optional[date] = None, n: int = 24) -> list[tuple[int, int]]:
+    """Lista (ano, mês) dos últimos N meses, mais recente primeiro."""
+    if today is None:
+        today = date.today()
+    months: list[tuple[int, int]] = []
+    y, m = today.year, today.month
+    for _ in range(n):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return months
+
+
 def month_label(d: date) -> str:
     meses = [
         "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
@@ -117,6 +155,7 @@ def fetch_ticker_info(ticker: str) -> dict:
         info = t.info or {}
         return {
             "shortName": info.get("shortName") or info.get("longName") or ticker,
+            "longName": info.get("longName"),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
             "marketCap": info.get("marketCap"),
@@ -129,6 +168,13 @@ def fetch_ticker_info(ticker: str) -> dict:
             "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
             "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
             "recommendationKey": info.get("recommendationKey"),
+            # Descrição e metadados do negócio
+            "longBusinessSummary": info.get("longBusinessSummary"),
+            "website": info.get("website"),
+            "country": info.get("country"),
+            "city": info.get("city"),
+            "state": info.get("state"),
+            "fullTimeEmployees": info.get("fullTimeEmployees"),
         }
     except Exception:
         return {"shortName": ticker}
@@ -366,10 +412,13 @@ def detect_patterns(df: pd.DataFrame) -> dict:
 def analyze_ticker(
     ticker: str,
     data: pd.DataFrame,
-    prev_start: date,
-    prev_end: date,
+    period_start: date,
+    period_end: date,
 ) -> Optional[dict]:
-    """Calcula métricas do ativo para o mês anterior + análise técnica ampla."""
+    """
+    Calcula métricas do ativo para o período (mês selecionado, podendo
+    ser o mês corrente parcial) + análise técnica ampla sobre toda a série.
+    """
     try:
         df = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
     except KeyError:
@@ -382,21 +431,21 @@ def analyze_ticker(
     if len(df) < 20:
         return None
 
-    # Recorte do mês anterior
-    mask = (df.index.date >= prev_start) & (df.index.date <= prev_end)
-    prev_df = df.loc[mask]
-    if len(prev_df) < 3:
+    # Recorte do período selecionado
+    mask = (df.index.date >= period_start) & (df.index.date <= period_end)
+    period_df = df.loc[mask]
+    if len(period_df) < 3:
         return None
 
-    first_close = prev_df["Close"].iloc[0]
-    last_close = prev_df["Close"].iloc[-1]
+    first_close = period_df["Close"].iloc[0]
+    last_close = period_df["Close"].iloc[-1]
     month_return = (last_close / first_close - 1) * 100
 
-    # Volume médio diário (R$) no mês anterior
+    # Volume médio diário (R$) no período
     avg_daily_volume_financial = float(
-        (prev_df["Close"] * prev_df["Volume"]).mean()
+        (period_df["Close"] * period_df["Volume"]).mean()
     )
-    avg_daily_volume_qty = float(prev_df["Volume"].mean())
+    avg_daily_volume_qty = float(period_df["Volume"].mean())
 
     # Indicadores técnicos usando a série histórica completa
     close = df["Close"]
@@ -409,7 +458,7 @@ def analyze_ticker(
     trend = trend_signal(close)
 
     # Retorno YTD (desde início do ano)
-    ytd_start = date(prev_end.year, 1, 1)
+    ytd_start = date(period_end.year, 1, 1)
     ytd_df = df.loc[df.index.date >= ytd_start]
     ytd_return = (
         (ytd_df["Close"].iloc[-1] / ytd_df["Close"].iloc[0] - 1) * 100
@@ -422,14 +471,15 @@ def analyze_ticker(
     if len(close) > 252:
         ret12m = (close.iloc[-1] / close.iloc[-252] - 1) * 100
 
-    # Dados fundamentalistas
+    # Dados fundamentalistas — sempre coagir para float (yfinance às vezes
+    # devolve string, "Infinity" ou tipos exóticos para alguns tickers)
     info = fetch_ticker_info(ticker)
-    dy_raw = info.get("dividendYield")
+    dy_raw = _to_float(info.get("dividendYield"))
     if dy_raw is None:
-        dy_raw = info.get("trailingAnnualDividendYield")
-    # yfinance retorna em fração (0.08 = 8%) ou já em % — normaliza para %
+        dy_raw = _to_float(info.get("trailingAnnualDividendYield"))
+    # yfinance pode devolver em fração (0.08 = 8%) ou já em % — normaliza
     if dy_raw is not None:
-        dy_pct = (dy_raw * 100) if dy_raw < 1.5 else float(dy_raw)
+        dy_pct = dy_raw * 100 if dy_raw < 1.5 else dy_raw
     else:
         dy_pct = None
 
@@ -445,18 +495,27 @@ def analyze_ticker(
         "volume_médio_R$": avg_daily_volume_financial,
         "volume_médio_qtd": avg_daily_volume_qty,
         "DY_%": dy_pct,
-        "P/L": info.get("trailingPE"),
-        "P/VP": info.get("priceToBook"),
-        "beta": info.get("beta"),
-        "market_cap": info.get("marketCap"),
+        "P/L": _to_float(info.get("trailingPE")),
+        "P/VP": _to_float(info.get("priceToBook")),
+        "beta": _to_float(info.get("beta")),
+        "market_cap": _to_float(info.get("marketCap")),
         "RSI": last_rsi,
         "SMA20": last_sma20,
         "SMA50": last_sma50,
         "SMA200": last_sma200,
         "vol_anual_%": vol_anual * 100 if not np.isnan(vol_anual) else np.nan,
         "tendência": trend,
-        "max_52s": info.get("fiftyTwoWeekHigh"),
-        "min_52s": info.get("fiftyTwoWeekLow"),
+        "max_52s": _to_float(info.get("fiftyTwoWeekHigh")),
+        "min_52s": _to_float(info.get("fiftyTwoWeekLow")),
+        # Descrição e metadados (para a seção "Sobre o ativo")
+        "nome_longo": info.get("longName") or info.get("shortName"),
+        "industry": info.get("industry"),
+        "descrição": info.get("longBusinessSummary"),
+        "website": info.get("website"),
+        "country": info.get("country"),
+        "city": info.get("city"),
+        "state": info.get("state"),
+        "funcionarios": _to_float(info.get("fullTimeEmployees")),
         "_close_series": close,
         "_ohlcv_df": df[["Open", "High", "Low", "Close", "Volume"]].copy(),
         "_patterns": detect_patterns(df),
@@ -485,15 +544,15 @@ def _norm(value, lo, hi):
 def compute_score(row: dict) -> dict:
     """
     Score probabilístico 0-100 combinando fatores:
-      - Momentum (retorno do mês anterior)            25%
-      - Tendência técnica (RSI + alinhamento SMA)     20%
-      - Liquidez (volume financeiro)                  15%
-      - Dividend Yield                                15%
-      - Valuation (P/L, P/VP invertidos)              10%
-      - Volatilidade (menor é melhor)                 10%
-      - Distância do topo 52 semanas                   5%
+      - Momentum (retorno do período analisado)        25%
+      - Tendência técnica (RSI + alinhamento SMA)      20%
+      - Liquidez (volume financeiro)                   15%
+      - Dividend Yield                                 15%
+      - Valuation (P/L, P/VP invertidos)               10%
+      - Volatilidade (menor é melhor)                  10%
+      - Distância do topo 52 semanas                    5%
     """
-    # Momentum — retorno do mês anterior
+    # Momentum — retorno acumulado no mês selecionado
     momentum = _norm(row.get("retorno_mês_%"), -10, 20)
 
     # RSI: prefere zona 40-65 (não sobrecomprado)
@@ -919,23 +978,50 @@ def generate_narrative(row: dict, patterns: dict, sector_compare: dict) -> str:
 
 
 def main():
-    st.title("Dashboard de Ativos — Top 10 do Mês Anterior")
+    st.title("Dashboard de Ativos — Top 10 do Mês")
     st.caption(
-        "Análise probabilística multi-fator de ações do Ibovespa e principais FIIs. "
-        "Dados via yfinance. Atualização diária."
+        "Análise probabilística multi-fator de ações do Ibovespa e principais "
+        "FIIs. Padrão: mês corrente (parcial). Use o seletor para navegar pelos "
+        "meses anteriores. Dados via yfinance, cache diário."
     )
 
     # --------- SIDEBAR ---------
+    today = date.today()
     with st.sidebar:
         st.header("Configurações")
 
-        ref_date = st.date_input(
-            "Data de referência",
-            value=date.today(),
-            help="A análise considera o mês anterior a esta data.",
+        # Seletor de mês — default é o mês corrente (índice 0 da lista)
+        recent = list_recent_months(today, n=24)
+
+        def _fmt_month(ym: tuple[int, int]) -> str:
+            y, m = ym
+            label = month_label(date(y, m, 1))
+            if (y, m) == (today.year, today.month):
+                return f"{label} (mês corrente)"
+            return label
+
+        selected_ym = st.selectbox(
+            "Mês de análise",
+            options=recent,
+            index=0,
+            format_func=_fmt_month,
+            help=(
+                "Mês corrente é parcial (até hoje). Meses anteriores cobrem o "
+                "mês inteiro."
+            ),
         )
-        prev_start, prev_end = previous_month_range(ref_date)
-        st.info(f"**Mês analisado:** {month_label(prev_start)}")
+        sel_year, sel_month = selected_ym
+        period_start, period_end = month_range(sel_year, sel_month, today)
+        is_current_month = (sel_year, sel_month) == (today.year, today.month)
+        n_dias = (period_end - period_start).days + 1
+        if is_current_month:
+            st.info(
+                f"**{month_label(period_start)}** (parcial: "
+                f"{period_start.strftime('%d/%m')} → "
+                f"{period_end.strftime('%d/%m')}, {n_dias} dias corridos)"
+            )
+        else:
+            st.info(f"**{month_label(period_start)}** (mês completo)")
 
         tipo_filtro = st.multiselect(
             "Tipos de ativo",
@@ -966,19 +1052,29 @@ def main():
         st.warning("Selecione ao menos um tipo de ativo na barra lateral.")
         return
 
-    # Para ter histórico suficiente para SMA200, puxamos 2 anos.
-    hist_start = prev_start - timedelta(days=500)
-    hist_end = ref_date
+    # Para ter histórico suficiente para SMA200, puxamos ~2 anos antes
+    # do início do período. O fim sempre vai até hoje (atualização diária).
+    hist_start = period_start - timedelta(days=500)
+    hist_end = today
 
     # --------- DOWNLOAD ---------
     with st.spinner(f"Baixando dados de {len(tickers)} ativos (cache diário)..."):
         data = download_prices(tickers, hist_start, hist_end)
 
+    # Aviso quando o mês corrente tem poucos pregões (período curto distorce
+    # leituras de retorno e volume).
+    if is_current_month and n_dias < 5:
+        st.warning(
+            f"Mês corrente com apenas {n_dias} dias corridos — retornos e "
+            "volumes do período podem ser pouco representativos. Considere "
+            "comparar com o mês anterior no seletor."
+        )
+
     # --------- ANÁLISE ---------
     rows = []
     progress = st.progress(0.0, text="Analisando ativos...")
     for i, tk in enumerate(tickers):
-        res = analyze_ticker(tk, data, prev_start, prev_end)
+        res = analyze_ticker(tk, data, period_start, period_end)
         if res:
             res.update(compute_score(res))
             res["classificação"] = classify(res["score"])
@@ -1022,13 +1118,29 @@ def main():
     st.divider()
 
     # --------- TOP 10 POR PERFORMANCE DO MÊS ---------
-    st.subheader(f"Top {top_n} — Melhor performance em {month_label(prev_start)}")
+    label_periodo = month_label(period_start)
+    if is_current_month:
+        label_periodo += " (parcial)"
+    st.subheader(f"Top {top_n} — Melhor performance em {label_periodo}")
     top_perf = df.sort_values("retorno_mês_%", ascending=False).head(top_n)
 
     display_cols = [
         "ticker", "nome", "tipo", "preço", "retorno_mês_%", "retorno_ytd_%",
         "DY_%", "P/L", "P/VP", "RSI", "tendência", "score", "classificação",
     ]
+    numeric_cols = [
+        "preço", "retorno_mês_%", "retorno_ytd_%", "DY_%", "P/L", "P/VP",
+        "RSI", "score",
+    ]
+
+    def _coerce_numeric(d: pd.DataFrame) -> pd.DataFrame:
+        """Garante que colunas numéricas sejam float (evita erro do Styler)."""
+        d = d.copy()
+        for c in numeric_cols:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d
+
     fmt_map = {
         "preço": "R$ {:.2f}",
         "retorno_mês_%": "{:.2f}%",
@@ -1040,7 +1152,9 @@ def main():
         "score": "{:.1f}",
     }
     st.dataframe(
-        top_perf[display_cols].style.format(fmt_map, na_rep="-").background_gradient(
+        _coerce_numeric(top_perf[display_cols]).style.format(
+            fmt_map, na_rep="-"
+        ).background_gradient(
             subset=["score", "retorno_mês_%"], cmap="RdYlGn",
         ),
         use_container_width=True, hide_index=True,
@@ -1050,7 +1164,9 @@ def main():
     st.subheader(f"Top {top_n} — Melhor score probabilístico (sugestões de compra)")
     top_score = df.sort_values("score", ascending=False).head(top_n)
     st.dataframe(
-        top_score[display_cols].style.format(fmt_map, na_rep="-").background_gradient(
+        _coerce_numeric(top_score[display_cols]).style.format(
+            fmt_map, na_rep="-"
+        ).background_gradient(
             subset=["score"], cmap="RdYlGn",
         ),
         use_container_width=True, hide_index=True,
@@ -1074,6 +1190,72 @@ def main():
 
         st.markdown(f"### {linha['nome']} (`{linha['ticker']}`)")
         st.caption(f"Setor: {linha['setor']} | Tipo: {linha['tipo']}")
+
+        # ----- Sobre o ativo (descrição do negócio) -----
+        with st.expander("Sobre o ativo", expanded=True):
+            descricao = linha.get("descrição")
+            nome_longo = linha.get("nome_longo")
+
+            if nome_longo and nome_longo != linha["nome"]:
+                st.markdown(f"**Razão social / nome completo:** {nome_longo}")
+
+            if descricao:
+                st.markdown(descricao)
+                st.caption(
+                    "Descrição original do yfinance (frequentemente em inglês "
+                    "para ativos brasileiros)."
+                )
+            else:
+                if linha["tipo"] == "FII":
+                    st.info(
+                        "Descrição detalhada não disponível na base do yfinance "
+                        "para este FII. Consulte o material do gestor (lâmina, "
+                        "relatório gerencial) para entender a estratégia, "
+                        "segmento dos imóveis e composição da carteira."
+                    )
+                else:
+                    st.info(
+                        "Descrição detalhada não disponível na base do yfinance "
+                        "para este ativo."
+                    )
+
+            # Metadados em colunas
+            metadados = []
+            industry = linha.get("industry")
+            if industry:
+                metadados.append(("Indústria", industry))
+
+            country = linha.get("country")
+            city = linha.get("city")
+            state = linha.get("state")
+            if country or city or state:
+                partes = [p for p in [city, state, country] if p]
+                if partes:
+                    metadados.append(("Sede", ", ".join(partes)))
+
+            funcionarios = linha.get("funcionarios")
+            if funcionarios and not (isinstance(funcionarios, float) and np.isnan(funcionarios)):
+                metadados.append(
+                    ("Funcionários", f"{int(funcionarios):,}".replace(",", "."))
+                )
+
+            mc = linha.get("market_cap")
+            if mc and not (isinstance(mc, float) and np.isnan(mc)):
+                metadados.append(("Valor de mercado", format_money(mc)))
+
+            website = linha.get("website")
+            if website:
+                # Garante prefixo http
+                site = website if website.startswith("http") else f"https://{website}"
+                metadados.append(("Site", f"[{website}]({site})"))
+
+            if metadados:
+                st.markdown("---")
+                # Distribui em até 3 colunas
+                ncols = min(len(metadados), 3)
+                cols = st.columns(ncols)
+                for i, (k, v) in enumerate(metadados):
+                    cols[i % ncols].markdown(f"**{k}**  \n{v}")
 
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Preço atual", f"R$ {linha['preço']:.2f}")
